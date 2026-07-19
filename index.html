@@ -49,6 +49,7 @@ const Info = mkIcon('<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path 
 const LayoutDashboard = mkIcon('<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>');
 const CheckCircle2 = mkIcon('<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>');
 const ChevronDown = mkIcon('<path d="m6 9 6 6 6-6"/>');
+const Sparkles = mkIcon('<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>');
 const Search = mkIcon('<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>');
 const Warehouse = mkIcon('<path d="M22 8.35V20a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8.35A2 2 0 0 1 3.26 6.5l8-3.2a2 2 0 0 1 1.48 0l8 3.2A2 2 0 0 1 22 8.35Z"/><path d="M6 18h12"/><path d="M6 14h12"/><rect width="12" height="12" x="6" y="10"/>');
 const CalendarClock = mkIcon('<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3.5"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h5"/><path d="M17.5 17.5 16 16.3V14"/><circle cx="16" cy="16" r="6"/>');
@@ -256,6 +257,32 @@ function MultiSelect({ label, options, selected, onChange, wide }) {
   );
 }
 
+
+// ============================================================
+// Dynamic narrative card — sentences recompute with filters
+// ============================================================
+function Narrative({ title, parts }) {
+  return (
+    <div className="rounded-xl border border-indigo-100 bg-indigo-50 p-4 shadow-sm">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <Sparkles className="h-4 w-4 text-indigo-600" />
+        <h2 className="text-sm font-bold text-slate-800">{title}</h2>
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-indigo-400">
+          auto-generated · updates with filters
+        </span>
+      </div>
+      <ul className="space-y-1.5">
+        {parts.map((p, i) => (
+          <li key={i} className="flex gap-2 text-sm leading-relaxed text-slate-700">
+            <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-400" />
+            <span>{p}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function TmsImsDashboard() {
   // ---------- global state ----------
   const [tab, setTab] = useState("overview"); // "overview" | "inventory"
@@ -450,6 +477,96 @@ function TmsImsDashboard() {
   }, [bus, lines, brands, products, salesTypes, metric]);
 
   const metricLabel = metric === "qty" ? "Units" : "EGP";
+
+  // ---------- dynamic narrative: overview ----------
+  const overviewStory = useMemo(() => {
+    const parts = [];
+    const scope = [];
+    if (months.length) scope.push(`months ${months.join(", ")}`);
+    if (bus.length) scope.push(`BU ${bus.join(", ")}`);
+    if (lines.length) scope.push(`line ${lines.join(", ")}`);
+    if (brands.length) scope.push(`brand ${brands.join(", ")}`);
+    if (products.length) scope.push(`${products.length} SKU${products.length === 1 ? "" : "s"}`);
+    if (salesTypes.length) scope.push(`${salesTypes.join(", ")} only`);
+    parts.push(scope.length
+      ? `Filtered view: ${scope.join(" · ")}.`
+      : `Full portfolio view, ${MONTHS[0]}–${MONTHS[N_MONTHS - 1]}, all business units and sales types.`);
+
+    if (kpi.tms === 0 && kpi.ims === 0) {
+      parts.push("No transactions match the current filters — widen the selection.");
+      return parts;
+    }
+    if (kpi.sellOut === null) {
+      parts.push(`No sell-in in this selection while sell-out totals ${fmtCompact(kpi.ims)} ${metricLabel} — the distributor is selling entirely from existing stock.`);
+    } else if (kpi.sellOut > 100) {
+      parts.push(`In-Market Sales (${fmtCompact(kpi.ims)}) exceed To-Market Sales (${fmtCompact(kpi.tms)}) by ${fmtCompact(-kpi.variance)} ${metricLabel} — a ${kpi.sellOut.toFixed(0)}% sell-out rate. The market is absorbing more than is being shipped; channel stock is being drawn down.`);
+    } else if (kpi.sellOut >= 80) {
+      parts.push(`Sell-out rate is ${kpi.sellOut.toFixed(0)}% (${fmtCompact(kpi.ims)} of ${fmtCompact(kpi.tms)} ${metricLabel}) — healthy throughput; shipments and demand are broadly in balance with a net stock build of ${fmtCompact(kpi.variance)} ${metricLabel}.`);
+    } else {
+      parts.push(`Only ${kpi.sellOut.toFixed(0)}% of sell-in is selling through (${fmtCompact(kpi.ims)} of ${fmtCompact(kpi.tms)} ${metricLabel}); ${fmtCompact(kpi.variance)} ${metricLabel} is accumulating in the channel — question the shipment plan for this selection.`);
+    }
+    const li = LAST_IMS_MONTH;
+    if (li >= 1) {
+      const cur = trendChart[li], prev = trendChart[li - 1];
+      if (prev.IMS > 0 && cur.IMS > 0) {
+        const g = ((cur.IMS - prev.IMS) / prev.IMS) * 100;
+        const gT = prev.TMS > 0 ? ((cur.TMS - prev.TMS) / prev.TMS) * 100 : null;
+        let s = `Momentum: In-Market Sales ${g >= 0 ? "grew" : "declined"} ${Math.abs(g).toFixed(0)}% in ${MONTHS[li]} vs ${MONTHS[li - 1]}`;
+        if (gT !== null) s += `, while To-Market Sales ${gT >= 0 ? "grew" : "declined"} ${Math.abs(gT).toFixed(0)}%`;
+        if (gT !== null && gT - g > 25) s += " — sell-in is outpacing sell-out; watch for channel loading";
+        if (gT !== null && g - gT > 25) s += " — demand is outrunning shipments; secure supply";
+        parts.push(s + ".");
+      }
+    }
+    if (brandChart.length > 1) {
+      const tot = brandChart.reduce((a, b) => a + b.TMS + b.IMS, 0);
+      const top = brandChart[0];
+      parts.push(`${top.brand} is the largest brand in this view at ${(((top.TMS + top.IMS) / tot) * 100).toFixed(0)}% of combined activity across the top ${brandChart.length}.`);
+    }
+    if (insights.risks.length || insights.bottlenecks.length) {
+      let s = `Exceptions: ${insights.risks.length} out-of-stock risk${insights.risks.length === 1 ? "" : "s"} and ${insights.bottlenecks.length} inventory bottleneck${insights.bottlenecks.length === 1 ? "" : "s"} flagged`;
+      if (insights.risks[0]) s += ` — largest depletion gap: ${insights.risks[0].brand} (−${fmtCompact(insights.risks[0].gap)} ${metricLabel})`;
+      if (insights.bottlenecks[0]) s += `; largest idle stock: ${insights.bottlenecks[0].brand} (+${fmtCompact(insights.bottlenecks[0].gap)} ${metricLabel})`;
+      parts.push(s + ".");
+    } else {
+      parts.push("No exception alerts in this selection.");
+    }
+    return parts;
+  }, [kpi, trendChart, brandChart, insights, months, bus, lines, brands, products, salesTypes, metricLabel]);
+
+  // ---------- dynamic narrative: channel inventory ----------
+  const invStory = useMemo(() => {
+    const parts = [];
+    const rows = inventory.rows;
+    if (!rows.length) { parts.push("No items match the current filters."); return parts; }
+    const lvl = invLevel === "sku" ? "SKU" : "brand";
+    parts.push(inventory.totInv >= 0
+      ? `An estimated ${fmtCompact(inventory.totInv)} ${metricLabel} is sitting at the distributor${inventory.portMoc !== null ? ` — ${inventory.portMoc.toFixed(1)} months of coverage at the current run-rate` : ""}.`
+      : `Net implied inventory is negative (${fmtCompact(inventory.totInv)} ${metricLabel}): the distributor has sold more than was shipped since ${MONTHS[0]}, meaning pre-period stock is being drawn down.`);
+    const risk = rows.filter((r) => r.moc !== null && r.moc >= 0 && r.moc < 1);
+    const over = rows.filter((r) => r.moc !== null && r.moc > 3);
+    const neg = rows.filter((r) => r.inv < 0);
+    if (risk.length) {
+      const first = risk[0];
+      parts.push(`${risk.length} ${lvl}${risk.length === 1 ? " is" : "s are"} below one month of cover — most urgent: ${first.key} (${first.moc.toFixed(1)} MoC, projected stockout ~${projectDate(first.moc)}). Prioritize replenishment.`);
+    } else {
+      parts.push(`No ${lvl}s are currently below one month of cover.`);
+    }
+    if (over.length) {
+      const worst = over.reduce((a, b) => (b.moc > a.moc ? b : a), over[0]);
+      parts.push(`${over.length} ${lvl}${over.length === 1 ? " sits" : "s sit"} above three months of cover — heaviest: ${worst.key} at ${worst.moc > 24 ? ">24" : worst.moc.toFixed(1)} months. Review expiry exposure and pause non-essential shipments.`);
+    }
+    if (neg.length) {
+      parts.push(`${neg.length} ${lvl}${neg.length === 1 ? " shows" : "s show"} negative implied inventory (pre-${MONTHS[0]} stock being sold). Request opening balances from the distributor to calibrate these figures.`);
+    }
+    const accel = rows.filter((r) => r.runP > 0 && r.run / r.runP >= 1.25).length;
+    const decel = rows.filter((r) => r.runP > 0 && r.run / r.runP <= 0.75).length;
+    if (accel || decel) {
+      parts.push(`Demand shift: ${accel} ${lvl}${accel === 1 ? "" : "s"} accelerating (last-3M run-rate ≥125% of period average) and ${decel} decelerating (≤75%). Coverage erodes faster than shown for accelerating items.`);
+    }
+    return parts;
+  }, [inventory, invLevel, metricLabel]);
+
   const activeGapMonths = GAP_MONTHS.filter((m) => sel(months, m));
   const onlyGapSelected = months.length > 0 && months.every((m) => GAP_MONTHS.includes(m));
   const activeFilterCount =
@@ -626,6 +743,8 @@ function TmsImsDashboard() {
               />
             </div>
 
+            <Narrative title="Executive Narrative" parts={overviewStory} />
+
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
               <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
                 <h2 className="text-sm font-bold text-slate-800">Brand Comparison — To-Market vs In-Market Sales</h2>
@@ -785,6 +904,8 @@ function TmsImsDashboard() {
                   : { bg: "bg-emerald-50", text: "text-emerald-700" }}
               />
             </div>
+
+            <Narrative title="Channel Inventory Narrative" parts={invStory} />
 
             {/* Coverage table */}
             <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
