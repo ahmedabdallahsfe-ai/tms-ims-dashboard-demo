@@ -29,7 +29,7 @@
 
 const { useState, useMemo } = React;
 const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
-        ResponsiveContainer, ComposedChart, Line, Area } = Recharts;
+        ResponsiveContainer, ComposedChart, Line, Area, ReferenceLine } = Recharts;
 
 // Lucide-style inline SVG icons (no lucide-react dependency)
 const mkIcon = (paths) => ({ className }) => (
@@ -52,6 +52,7 @@ const ChevronDown = mkIcon('<path d="m6 9 6 6 6-6"/>');
 const Sparkles = mkIcon('<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>');
 const Search = mkIcon('<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>');
 const Warehouse = mkIcon('<path d="M22 8.35V20a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8.35A2 2 0 0 1 3.26 6.5l8-3.2a2 2 0 0 1 1.48 0l8 3.2A2 2 0 0 1 22 8.35Z"/><path d="M6 18h12"/><path d="M6 14h12"/><rect width="12" height="12" x="6" y="10"/>');
+const Repeat = mkIcon('<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>');
 const CalendarClock = mkIcon('<path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3.5"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h5"/><path d="M17.5 17.5 16 16.3V14"/><circle cx="16" cy="16" r="6"/>');
 const Boxes = mkIcon('<path d="M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.8a2 2 0 0 0 2.06 0L12 19v-5.5l-5-3-4.03 2.42Z"/><path d="m7 16.5-4.74-2.85"/><path d="m7 16.5 5-3"/><path d="M7 16.5v5.17"/><path d="M12 13.5V19l3.97 2.38a2 2 0 0 0 2.06 0l3-1.8a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71L17 10.5l-5 3Z"/><path d="m17 16.5-5-3"/><path d="m17 16.5 4.74-2.85"/><path d="M17 16.5v5.17"/><path d="M7.97 4.42A2 2 0 0 0 7 6.13v4.37l5 3 5-3V6.13a2 2 0 0 0-.97-1.71l-3-1.8a2 2 0 0 0-2.06 0l-3 1.8Z"/><path d="M12 8 7.26 5.15"/><path d="m12 8 4.74-2.85"/><path d="M12 13.5V8"/>');
 
@@ -567,6 +568,133 @@ function TmsImsDashboard() {
     return parts;
   }, [inventory, invLevel, metricLabel]);
 
+  // ---------- PULL-THROUGH ANALYSIS: lagged TMS(M-1) → IMS(M) ----------
+  const lagPairs = useMemo(() => {
+    // Build monthly TMS & IMS by brand
+    const byBrand = new Map();
+    for (const d of DATA) {
+      if (!dimOk(d)) continue;
+      let o = byBrand.get(d.brand);
+      if (!o) {
+        o = { brand: d.brand, tms: Array(N_MONTHS).fill(0), ims: Array(N_MONTHS).fill(0) };
+        byBrand.set(d.brand, o);
+      }
+      (d.type === TYPE_TMS ? o.tms : o.ims)[d.month] += d[metric];
+    }
+
+    // Build lag pairs: TMS(m) drives IMS(m+1)
+    const pairs = [];
+    for (let m = 0; m < N_MONTHS - 1; m++) {
+      const nextM = m + 1;
+      // Check if IMS exists for nextM (globally)
+      const hasIms = DATA.some((d) => d.month === nextM && d.type !== TYPE_TMS);
+      if (!hasIms) continue;
+      let totTms = 0, totIms = 0;
+      const brandPT = [];
+      for (const [br, o] of byBrand) {
+        const t = o.tms[m], i = o.ims[nextM];
+        totTms += t; totIms += i;
+        if (t > 0) brandPT.push({ brand: br, tms: t, ims: i, pt: (i / t) * 100 });
+      }
+      pairs.push({
+        label: `${MONTHS[m].split(" ")[0]}→${MONTHS[nextM].split(" ")[0]}`,
+        tmsMonth: MONTHS[m], imsMonth: MONTHS[nextM],
+        tms: totTms, ims: totIms,
+        pt: totTms > 0 ? (totIms / totTms) * 100 : null,
+        brands: brandPT.sort((a, b) => b.tms - a.tms)
+      });
+    }
+    return pairs;
+  }, [bus, lines, brands, products, salesTypes, metric]);
+
+  // Portfolio-level pull-through KPIs
+  const ptKpi = useMemo(() => {
+    if (!lagPairs.length) return { avgPt: null, bestPair: null, worstPair: null, trend: null };
+    const valid = lagPairs.filter((p) => p.pt !== null);
+    const avgPt = valid.length ? valid.reduce((s, p) => s + p.pt, 0) / valid.length : null;
+    const bestPair = valid.reduce((a, b) => (b.pt > a.pt ? b : a), valid[0]);
+    const worstPair = valid.reduce((a, b) => (b.pt < a.pt ? b : a), valid[0]);
+    const trend = valid.length >= 2
+      ? valid[valid.length - 1].pt - valid[0].pt : null;
+    return { avgPt, bestPair, worstPair, trend };
+  }, [lagPairs]);
+
+  // Brand-level pull-through summary (across all lag periods)
+  const brandPT = useMemo(() => {
+    const map = new Map();
+    for (const pair of lagPairs) {
+      for (const b of pair.brands) {
+        let o = map.get(b.brand);
+        if (!o) o = { brand: b.brand, tms: 0, ims: 0, pairs: 0 };
+        o.tms += b.tms; o.ims += b.ims; o.pairs++;
+        map.set(b.brand, o);
+      }
+    }
+    return [...map.values()]
+      .map((o) => ({ ...o, pt: o.tms > 0 ? (o.ims / o.tms) * 100 : null }))
+      .filter((o) => o.pt !== null)
+      .sort((a, b) => b.tms - a.tms);
+  }, [lagPairs]);
+
+  // Pull-through heatmap (brand x lag pair)
+  const ptHeatmap = useMemo(() => {
+    const topBrands = brandPT.slice(0, 20);
+    return topBrands.map((b) => {
+      const cells = lagPairs.map((pair) => {
+        const match = pair.brands.find((x) => x.brand === b.brand);
+        return match ? match.pt : null;
+      });
+      return { brand: b.brand, cells, avgPt: b.pt };
+    });
+  }, [brandPT, lagPairs]);
+
+  // TMS vs IMS growth gap by period
+  const growthGap = useMemo(() => {
+    if (lagPairs.length < 2) return [];
+    return lagPairs.slice(1).map((cur, i) => {
+      const prev = lagPairs[i];
+      const tmsG = prev.tms > 0 ? ((cur.tms - prev.tms) / prev.tms) * 100 : null;
+      const imsG = prev.ims > 0 ? ((cur.ims - prev.ims) / prev.ims) * 100 : null;
+      return { label: cur.label, tmsGrowth: tmsG, imsGrowth: imsG,
+               gap: tmsG !== null && imsG !== null ? tmsG - imsG : null };
+    });
+  }, [lagPairs]);
+
+  // Lag narrative
+  const lagStory = useMemo(() => {
+    const parts = [];
+    if (!lagPairs.length) { parts.push("Insufficient data for lagged analysis."); return parts; }
+
+    parts.push(ptKpi.avgPt !== null
+      ? `Average pull-through rate across ${lagPairs.length} lag periods is ${ptKpi.avgPt.toFixed(0)}% — ${
+          ptKpi.avgPt >= 85 ? "strong channel absorption; supply and demand are well-aligned" :
+          ptKpi.avgPt >= 65 ? "moderate absorption; some inventory build-up each cycle" :
+          "low pull-through; significant inventory accumulation — review demand forecasting and shipment cadence"
+        }.`
+      : "No valid pull-through data for current filters.");
+
+    if (ptKpi.trend !== null) {
+      parts.push(`Trend: pull-through ${ptKpi.trend >= 0 ? "improved" : "deteriorated"} by ${Math.abs(ptKpi.trend).toFixed(0)}pp from first to last period${
+        ptKpi.trend >= 10 ? " — channel is absorbing faster, healthy trajectory for a growth-phase company" :
+        ptKpi.trend <= -10 ? " — channel absorption is weakening; pipeline may be overfilled" :
+        " — relatively stable absorption"
+      }.`);
+    }
+
+    if (ptKpi.bestPair && ptKpi.worstPair && ptKpi.bestPair.label !== ptKpi.worstPair.label) {
+      parts.push(`Best period: ${ptKpi.bestPair.label} at ${ptKpi.bestPair.pt.toFixed(0)}%. Weakest: ${ptKpi.worstPair.label} at ${ptKpi.worstPair.pt.toFixed(0)}%.`);
+    }
+
+    if (brandPT.length) {
+      const high = brandPT.filter((b) => b.pt >= 100);
+      const low = brandPT.filter((b) => b.pt < 50);
+      if (high.length) parts.push(`${high.length} brand${high.length === 1 ? "" : "s"} with ≥100% pull-through (channel depleting stock): ${high.slice(0, 3).map((b) => b.brand).join(", ")}${high.length > 3 ? ` +${high.length - 3} more` : ""}. Ensure adequate supply.`);
+      if (low.length) parts.push(`${low.length} brand${low.length === 1 ? "" : "s"} below 50% pull-through (heavy channel loading): ${low.slice(0, 3).map((b) => b.brand).join(", ")}${low.length > 3 ? ` +${low.length - 3} more` : ""}. Pause shipments or investigate demand barriers.`);
+    }
+
+    return parts;
+  }, [lagPairs, ptKpi, brandPT]);
+
   const activeGapMonths = GAP_MONTHS.filter((m) => sel(months, m));
   const onlyGapSelected = months.length > 0 && months.every((m) => GAP_MONTHS.includes(m));
   const activeFilterCount =
@@ -649,6 +777,7 @@ function TmsImsDashboard() {
             {[
               { id: "overview", label: "Overview", Icon: LayoutDashboard },
               { id: "inventory", label: "Channel Inventory", Icon: Warehouse },
+              { id: "pullthrough", label: "Pull-Through Analysis", Icon: Repeat },
             ].map(({ id, label, Icon }) => (
               <button
                 key={id}
@@ -1029,6 +1158,241 @@ function TmsImsDashboard() {
                 </table>
               </div>
             </div>
+          </>
+        )}
+
+        {/* ================= PULL-THROUGH ANALYSIS TAB ================= */}
+        {tab === "pullthrough" && (
+          <>
+            <div className="flex items-start gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-xs text-sky-800">
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                <strong>Lagged Analysis:</strong> Each month's In-Market Sales is matched to the <em>previous</em> month's To-Market Sales — the shipments that drove it.
+                Pull-Through Rate = IMS(M) ÷ TMS(M−1) × 100. Rates above 100% mean the channel is depleting stock; below 60% signals inventory accumulation.
+                This view shows {lagPairs.length} complete lag pair{lagPairs.length === 1 ? "" : "s"}: {lagPairs.map((p) => p.label).join(", ")}.
+              </span>
+            </div>
+
+            {/* Pull-Through KPI cards */}
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+              <KpiCard
+                icon={Repeat} label="Avg Pull-Through Rate"
+                value={ptKpi.avgPt === null ? "N/A" : ptKpi.avgPt.toFixed(0) + "%"}
+                sub={`IMS(M) ÷ TMS(M−1) across ${lagPairs.length} periods`}
+                accent={ptKpi.avgPt === null ? { bg: "bg-slate-100", text: "text-slate-500" }
+                  : ptKpi.avgPt >= 85 ? { bg: "bg-emerald-50", text: "text-emerald-700", value: "text-emerald-700" }
+                  : ptKpi.avgPt >= 65 ? { bg: "bg-amber-50", text: "text-amber-600", value: "text-amber-600" }
+                  : { bg: "bg-red-50", text: "text-red-600", value: "text-red-600" }}
+              />
+              <KpiCard
+                icon={TrendingDown} label="PT Trend (First→Last)"
+                value={ptKpi.trend === null ? "N/A" : (ptKpi.trend >= 0 ? "+" : "") + ptKpi.trend.toFixed(0) + "pp"}
+                sub={ptKpi.trend === null ? "Need ≥2 periods"
+                  : ptKpi.trend >= 0 ? "Channel absorption improving" : "Channel absorption weakening"}
+                accent={ptKpi.trend === null ? { bg: "bg-slate-100", text: "text-slate-500" }
+                  : ptKpi.trend >= 0 ? { bg: "bg-emerald-50", text: "text-emerald-700", value: "text-emerald-700" }
+                  : { bg: "bg-red-50", text: "text-red-600", value: "text-red-600" }}
+              />
+              <KpiCard
+                icon={Package} label="Best Period"
+                value={ptKpi.bestPair ? ptKpi.bestPair.pt.toFixed(0) + "%" : "N/A"}
+                sub={ptKpi.bestPair ? ptKpi.bestPair.label : ""}
+                accent={{ bg: "bg-emerald-50", text: "text-emerald-700", value: "text-emerald-700" }}
+              />
+              <KpiCard
+                icon={AlertTriangle} label="Weakest Period"
+                value={ptKpi.worstPair ? ptKpi.worstPair.pt.toFixed(0) + "%" : "N/A"}
+                sub={ptKpi.worstPair ? ptKpi.worstPair.label : ""}
+                accent={ptKpi.worstPair && ptKpi.worstPair.pt < 65
+                  ? { bg: "bg-red-50", text: "text-red-600", value: "text-red-600" }
+                  : { bg: "bg-amber-50", text: "text-amber-600", value: "text-amber-600" }}
+              />
+            </div>
+
+            <Narrative title="Pull-Through Narrative" parts={lagStory} />
+
+            {/* Pull-Through Trend Chart */}
+            <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+              <h2 className="text-sm font-bold text-slate-800">Pull-Through Rate by Period</h2>
+              <p className="mb-3 text-xs text-slate-400">
+                Bar = pull-through % for each lag pair · Line = cumulative portfolio PT ·
+                Green zone 85–100% · Yellow 65–85% · Red &lt;65%
+              </p>
+              <div style={{ width: "100%", height: 320 }}>
+                <ResponsiveContainer>
+                  <ComposedChart data={lagPairs.map((p) => ({
+                    name: p.label,
+                    pt: p.pt !== null ? Math.round(p.pt * 10) / 10 : 0,
+                    tms: p.tms,
+                    ims: p.ims
+                  }))} margin={{ top: 20, right: 30, bottom: 5, left: 10 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                    <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                    <YAxis tick={{ fontSize: 11 }} domain={[0, "auto"]} unit="%" />
+                    <Tooltip content={({ active, payload, label }) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0]?.payload;
+                      return (
+                        <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 shadow-lg text-xs">
+                          <p className="font-semibold text-slate-700 mb-1">{label}</p>
+                          <p className="text-indigo-600 font-medium">Pull-Through: {d.pt}%</p>
+                          <p className="text-slate-500">TMS(M-1): {fmtFull(d.tms)} {metricLabel}</p>
+                          <p className="text-slate-500">IMS(M): {fmtFull(d.ims)} {metricLabel}</p>
+                        </div>
+                      );
+                    }} />
+                    <ReferenceLine y={85} stroke="#10b981" strokeDasharray="4 4" label={{ value: "85%", position: "left", fontSize: 10, fill: "#10b981" }} />
+                    <ReferenceLine y={65} stroke="#f59e0b" strokeDasharray="4 4" label={{ value: "65%", position: "left", fontSize: 10, fill: "#f59e0b" }} />
+                    <Bar dataKey="pt" fill="#6366f1" radius={[6, 6, 0, 0]} barSize={48} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* TMS vs IMS Growth Gap Chart */}
+            {growthGap.length > 0 && (
+              <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <h2 className="text-sm font-bold text-slate-800">TMS vs IMS Growth Gap</h2>
+                <p className="mb-3 text-xs text-slate-400">
+                  Period-over-period growth rates · In a healthy growth phase, IMS growth should converge toward TMS growth over time
+                </p>
+                <div style={{ width: "100%", height: 280 }}>
+                  <ResponsiveContainer>
+                    <ComposedChart data={growthGap.map((g) => ({
+                      name: g.label,
+                      TMS: g.tmsGrowth !== null ? Math.round(g.tmsGrowth * 10) / 10 : 0,
+                      IMS: g.imsGrowth !== null ? Math.round(g.imsGrowth * 10) / 10 : 0,
+                      gap: g.gap !== null ? Math.round(g.gap * 10) / 10 : 0
+                    }))} margin={{ top: 20, right: 30, bottom: 5, left: 10 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                      <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                      <YAxis tick={{ fontSize: 11 }} unit="%" />
+                      <Tooltip content={({ active, payload, label }) => {
+                        if (!active || !payload?.length) return null;
+                        const d = payload[0]?.payload;
+                        return (
+                          <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 shadow-lg text-xs">
+                            <p className="font-semibold text-slate-700 mb-1">{label}</p>
+                            <p style={{ color: "#6366f1" }} className="font-medium">TMS Growth: {d.TMS}%</p>
+                            <p style={{ color: "#10b981" }} className="font-medium">IMS Growth: {d.IMS}%</p>
+                            <p className="text-slate-500 font-medium">Gap: {d.gap > 0 ? "+" : ""}{d.gap}pp</p>
+                          </div>
+                        );
+                      }} />
+                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      <Bar dataKey="TMS" name="TMS Growth %" fill="#6366f1" radius={[4, 4, 0, 0]} barSize={28} />
+                      <Bar dataKey="IMS" name="IMS Growth %" fill="#10b981" radius={[4, 4, 0, 0]} barSize={28} />
+                      <Line dataKey="gap" name="Gap (pp)" type="monotone" stroke="#f43f5e" strokeWidth={2} dot={{ r: 4 }} />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+
+            {/* Brand Pull-Through Table */}
+            <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+              <h2 className="text-sm font-bold text-slate-800">Conversion Efficiency by Brand</h2>
+              <p className="mb-3 text-xs text-slate-400">
+                Aggregated pull-through across all lag periods · Sorted by TMS volume (largest first)
+              </p>
+              <div className="max-h-[420px] overflow-auto rounded-lg border border-slate-100">
+                <table className="w-full min-w-[700px] text-left text-sm">
+                  <thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
+                    <tr>
+                      <th className="px-3 py-2">Brand</th>
+                      <th className="px-3 py-2 text-right">TMS (Lagged)</th>
+                      <th className="px-3 py-2 text-right">IMS (Matched)</th>
+                      <th className="px-3 py-2 text-right">Pull-Through %</th>
+                      <th className="px-3 py-2 text-right">Lag Periods</th>
+                      <th className="px-3 py-2">Assessment</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {brandPT.map((r) => {
+                      const cls = r.pt >= 100 ? "bg-violet-100 text-violet-800"
+                        : r.pt >= 85 ? "bg-emerald-100 text-emerald-800"
+                        : r.pt >= 65 ? "bg-amber-100 text-amber-800"
+                        : r.pt >= 50 ? "bg-orange-100 text-orange-800"
+                        : "bg-red-100 text-red-800";
+                      const lbl = r.pt >= 100 ? "Depleting"
+                        : r.pt >= 85 ? "Healthy"
+                        : r.pt >= 65 ? "Moderate"
+                        : r.pt >= 50 ? "Weak"
+                        : "Channel Loading";
+                      return (
+                        <tr key={r.brand} className="hover:bg-slate-50">
+                          <td className="max-w-[200px] truncate px-3 py-1.5 font-medium text-slate-800" title={r.brand}>{r.brand}</td>
+                          <td className="px-3 py-1.5 text-right tabular-nums text-slate-600">{fmtCompact(r.tms)}</td>
+                          <td className="px-3 py-1.5 text-right tabular-nums text-slate-600">{fmtCompact(r.ims)}</td>
+                          <td className="px-3 py-1.5 text-right font-bold tabular-nums text-slate-800">{r.pt.toFixed(0)}%</td>
+                          <td className="px-3 py-1.5 text-right tabular-nums text-slate-500">{r.pairs}</td>
+                          <td className="px-3 py-1.5">
+                            <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${cls}`}>{lbl}</span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Pull-Through Heatmap: Brand × Lag Period */}
+            {ptHeatmap.length > 0 && (
+              <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+                <h2 className="text-sm font-bold text-slate-800">Pull-Through Heatmap — Brand × Lag Period</h2>
+                <p className="mb-3 text-xs text-slate-400">
+                  Top {ptHeatmap.length} brands by volume · cell = IMS(M) ÷ TMS(M−1) % ·
+                  <span className="ml-1 rounded bg-red-100 px-1 text-red-800">&lt;50%</span>
+                  <span className="ml-1 rounded bg-orange-100 px-1 text-orange-800">50–65%</span>
+                  <span className="ml-1 rounded bg-amber-100 px-1 text-amber-800">65–85%</span>
+                  <span className="ml-1 rounded bg-emerald-100 px-1 text-emerald-800">85–100%</span>
+                  <span className="ml-1 rounded bg-violet-100 px-1 text-violet-800">&gt;100%</span>
+                </p>
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[640px] text-sm">
+                    <thead>
+                      <tr className="text-[11px] uppercase tracking-wide text-slate-500">
+                        <th className="px-2 py-1 text-left">Brand</th>
+                        {lagPairs.map((p) => (
+                          <th key={p.label} className="px-2 py-1 text-center">{p.label}</th>
+                        ))}
+                        <th className="px-2 py-1 text-center">Avg</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ptHeatmap.map((row) => (
+                        <tr key={row.brand}>
+                          <td className="max-w-[160px] truncate px-2 py-1 text-xs font-semibold text-slate-700" title={row.brand}>{row.brand}</td>
+                          {row.cells.map((c, i) => {
+                            const cls = c === null ? "bg-slate-100 text-slate-400"
+                              : c >= 100 ? "bg-violet-100 text-violet-800"
+                              : c >= 85 ? "bg-emerald-100 text-emerald-800"
+                              : c >= 65 ? "bg-amber-100 text-amber-800"
+                              : c >= 50 ? "bg-orange-200 text-orange-900"
+                              : "bg-red-200 text-red-900";
+                            return (
+                              <td key={i} className="px-1 py-0.5">
+                                <div className={`rounded-md px-1 py-1 text-center text-xs font-semibold tabular-nums ${cls}`}>
+                                  {c === null ? "·" : c.toFixed(0) + "%"}
+                                </div>
+                              </td>
+                            );
+                          })}
+                          <td className="px-1 py-0.5">
+                            <div className={`rounded-md px-1 py-1 text-center text-xs font-bold tabular-nums ${
+                              row.avgPt >= 85 ? "bg-emerald-200 text-emerald-900" : row.avgPt >= 65 ? "bg-amber-200 text-amber-900" : "bg-red-200 text-red-900"
+                            }`}>
+                              {row.avgPt.toFixed(0)}%
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </>
         )}
 
