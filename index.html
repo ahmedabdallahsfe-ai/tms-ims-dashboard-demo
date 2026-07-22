@@ -378,12 +378,57 @@ function TmsImsDashboard() {
   }, [filtered, metric]);
 
   const trendChart = useMemo(() => {
-    const rows = MONTHS.map((m) => ({ month: m, TMS: 0, IMS: 0 }));
+    const rows = MONTHS.map((m) => ({ month: m, TMS: 0, IMS: 0, PT: null }));
     for (const d of DATA) {
       if (!dimOk(d)) continue;
       rows[d.month][d.type === TYPE_TMS ? "TMS" : "IMS"] += d[metric];
     }
+    // Compute lagged Pull-Through Rate: PT(m) = IMS(m) / TMS(m-1) × 100
+    for (let m = 1; m < rows.length; m++) {
+      if (rows[m - 1].TMS > 0 && rows[m].IMS > 0) {
+        rows[m].PT = (rows[m].IMS / rows[m - 1].TMS) * 100;
+      }
+    }
     return rows;
+  }, [bus, lines, brands, products, salesTypes, metric]);
+
+  // ---------- PULL-THROUGH ANALYSIS: lagged TMS(M-1) → IMS(M) ----------
+  // (moved above insights so insights can reference lagPairs for PT enrichment)
+  const lagPairs = useMemo(() => {
+    // Build monthly TMS & IMS by brand
+    const byBrandPT = new Map();
+    for (const d of DATA) {
+      if (!dimOk(d)) continue;
+      let o = byBrandPT.get(d.brand);
+      if (!o) {
+        o = { brand: d.brand, tms: Array(N_MONTHS).fill(0), ims: Array(N_MONTHS).fill(0) };
+        byBrandPT.set(d.brand, o);
+      }
+      (d.type === TYPE_TMS ? o.tms : o.ims)[d.month] += d[metric];
+    }
+
+    // Build lag pairs: TMS(m) drives IMS(m+1)
+    const pairs = [];
+    for (let m = 0; m < N_MONTHS - 1; m++) {
+      const nextM = m + 1;
+      const hasIms = DATA.some((d) => d.month === nextM && d.type !== TYPE_TMS);
+      if (!hasIms) continue;
+      let totTms = 0, totIms = 0;
+      const brandPTList = [];
+      for (const [br, o] of byBrandPT) {
+        const t = o.tms[m], i = o.ims[nextM];
+        totTms += t; totIms += i;
+        if (t > 0) brandPTList.push({ brand: br, tms: t, ims: i, pt: (i / t) * 100 });
+      }
+      pairs.push({
+        label: `${MONTHS[m].split(" ")[0]}→${MONTHS[nextM].split(" ")[0]}`,
+        tmsMonth: MONTHS[m], imsMonth: MONTHS[nextM],
+        tms: totTms, ims: totIms,
+        pt: totTms > 0 ? (totIms / totTms) * 100 : null,
+        brands: brandPTList.sort((a, b) => b.tms - a.tms)
+      });
+    }
+    return pairs;
   }, [bus, lines, brands, products, salesTypes, metric]);
 
   // ---------- insights (overview bottom row) ----------
@@ -396,18 +441,45 @@ function TmsImsDashboard() {
       if (!map.has(d.brand)) map.set(d.brand, { TMS: 0, IMS: 0 });
       map.get(d.brand)[d.type === TYPE_TMS ? "TMS" : "IMS"] += d[metric];
     }
-    const risks = [], bottlenecks = [];
+    // Compute brand-level PT rates for enrichment
+    const brandPtMap = new Map();
+    for (const pair of lagPairs) {
+      for (const bp of pair.brands) {
+        let o = brandPtMap.get(bp.brand);
+        if (!o) o = { tms: 0, ims: 0, periods: [], count: 0 };
+        o.tms += bp.tms; o.ims += bp.ims; o.periods.push(bp.pt); o.count++;
+        brandPtMap.set(bp.brand, o);
+      }
+    }
+    const getBrandPt = (b) => {
+      const o = brandPtMap.get(b);
+      if (!o || o.tms === 0) return { avgPt: null, lastPt: null, trend: null };
+      const avgPt = (o.ims / o.tms) * 100;
+      const lastPt = o.periods.length ? o.periods[o.periods.length - 1] : null;
+      const firstPt = o.periods.length >= 2 ? o.periods[0] : null;
+      const trend = firstPt !== null && lastPt !== null ? lastPt - firstPt : null;
+      return { avgPt, lastPt, trend };
+    };
+
+    const risks = [], bottlenecks = [], ptDeclining = [];
     for (const [b, v] of map) {
       if (v.TMS === 0 && v.IMS === 0) continue;
+      const pt = getBrandPt(b);
       if (v.IMS > v.TMS)
-        risks.push({ brand: b, gap: v.IMS - v.TMS, rate: v.TMS > 0 ? (v.IMS / v.TMS) * 100 : null });
+        risks.push({ brand: b, gap: v.IMS - v.TMS, rate: v.TMS > 0 ? (v.IMS / v.TMS) * 100 : null, pt });
       else if (v.TMS > 0 && (v.IMS / v.TMS) * 100 < 50)
-        bottlenecks.push({ brand: b, gap: v.TMS - v.IMS, rate: (v.IMS / v.TMS) * 100 });
+        bottlenecks.push({ brand: b, gap: v.TMS - v.IMS, rate: (v.IMS / v.TMS) * 100, pt });
+      // PT Declining: brands where last-period PT dropped >15pp vs avg
+      if (pt.avgPt !== null && pt.lastPt !== null && pt.trend !== null && pt.trend < -15
+          && !(v.IMS > v.TMS) && !(v.TMS > 0 && (v.IMS / v.TMS) * 100 < 50)) {
+        ptDeclining.push({ brand: b, avgPt: pt.avgPt, lastPt: pt.lastPt, trend: pt.trend });
+      }
     }
     risks.sort((a, b) => b.gap - a.gap);
     bottlenecks.sort((a, b) => b.gap - a.gap);
-    return { risks, bottlenecks };
-  }, [months, bus, lines, salesTypes, metric]);
+    ptDeclining.sort((a, b) => a.trend - b.trend);
+    return { risks, bottlenecks, ptDeclining };
+  }, [months, bus, lines, salesTypes, metric, lagPairs]);
 
   // ---------- CHANNEL INVENTORY: implied inventory, MoC, stockout ----------
   const inventory = useMemo(() => {
@@ -431,7 +503,34 @@ function TmsImsDashboard() {
       const runP = cumI / (LAST_IMS_MONTH + 1); // full-period avg IMS run-rate
       const inv = cumT - cumI;
       const moc = run > 0 ? inv / run : null;
-      return { ...o, cumT, cumI, run, runP, inv, moc };
+
+      // Pull-Through Rate for this item (lagged: IMS(m) / TMS(m-1))
+      let ptTms = 0, ptIms = 0, ptPeriods = 0;
+      let ptLast = null, ptFirst = null;
+      for (let m = 0; m < N_MONTHS - 1; m++) {
+        const nextM = m + 1;
+        if (nextM > LAST_IMS_MONTH) break;
+        if (o.tms[m] > 0) {
+          const pRate = (o.ims[nextM] / o.tms[m]) * 100;
+          ptTms += o.tms[m]; ptIms += o.ims[nextM]; ptPeriods++;
+          if (ptFirst === null) ptFirst = pRate;
+          ptLast = pRate;
+        }
+      }
+      const ptRate = ptTms > 0 ? (ptIms / ptTms) * 100 : null;
+      const ptTrend = ptFirst !== null && ptLast !== null && ptPeriods >= 2 ? ptLast - ptFirst : null;
+
+      // PT-adjusted run-rate: weight by recent PT momentum
+      let adjRun = run;
+      if (ptTrend !== null && run > 0) {
+        // If PT accelerating, demand will be higher → faster depletion
+        // If PT decelerating, demand will be lower → slower depletion
+        const ptFactor = 1 + (ptTrend / 100) * 0.5; // damped adjustment
+        adjRun = run * Math.max(0.5, Math.min(1.5, ptFactor));
+      }
+      const adjMoc = adjRun > 0 ? inv / adjRun : null;
+
+      return { ...o, cumT, cumI, run, runP, inv, moc, ptRate, ptTrend, adjRun, adjMoc };
     });
     // sort: stockout risk first (asc MoC, negatives first), no-offtake last
     rows.sort((a, b) => {
@@ -524,10 +623,11 @@ function TmsImsDashboard() {
       const top = brandChart[0];
       parts.push(`${top.brand} is the largest brand in this view at ${(((top.TMS + top.IMS) / tot) * 100).toFixed(0)}% of combined activity across the top ${brandChart.length}.`);
     }
-    if (insights.risks.length || insights.bottlenecks.length) {
-      let s = `Exceptions: ${insights.risks.length} out-of-stock risk${insights.risks.length === 1 ? "" : "s"} and ${insights.bottlenecks.length} inventory bottleneck${insights.bottlenecks.length === 1 ? "" : "s"} flagged`;
+    if (insights.risks.length || insights.bottlenecks.length || insights.ptDeclining.length) {
+      let s = `Exceptions: ${insights.risks.length} out-of-stock risk${insights.risks.length === 1 ? "" : "s"}, ${insights.bottlenecks.length} inventory bottleneck${insights.bottlenecks.length === 1 ? "" : "s"}, and ${insights.ptDeclining.length} PT-declining brand${insights.ptDeclining.length === 1 ? "" : "s"} flagged`;
       if (insights.risks[0]) s += ` — largest depletion gap: ${insights.risks[0].brand} (−${fmtCompact(insights.risks[0].gap)} ${metricLabel})`;
       if (insights.bottlenecks[0]) s += `; largest idle stock: ${insights.bottlenecks[0].brand} (+${fmtCompact(insights.bottlenecks[0].gap)} ${metricLabel})`;
+      if (insights.ptDeclining[0]) s += `; steepest PT drop: ${insights.ptDeclining[0].brand} (${insights.ptDeclining[0].trend.toFixed(0)}pp)`;
       parts.push(s + ".");
     } else {
       parts.push("No exception alerts in this selection.");
@@ -567,45 +667,6 @@ function TmsImsDashboard() {
     }
     return parts;
   }, [inventory, invLevel, metricLabel]);
-
-  // ---------- PULL-THROUGH ANALYSIS: lagged TMS(M-1) → IMS(M) ----------
-  const lagPairs = useMemo(() => {
-    // Build monthly TMS & IMS by brand
-    const byBrand = new Map();
-    for (const d of DATA) {
-      if (!dimOk(d)) continue;
-      let o = byBrand.get(d.brand);
-      if (!o) {
-        o = { brand: d.brand, tms: Array(N_MONTHS).fill(0), ims: Array(N_MONTHS).fill(0) };
-        byBrand.set(d.brand, o);
-      }
-      (d.type === TYPE_TMS ? o.tms : o.ims)[d.month] += d[metric];
-    }
-
-    // Build lag pairs: TMS(m) drives IMS(m+1)
-    const pairs = [];
-    for (let m = 0; m < N_MONTHS - 1; m++) {
-      const nextM = m + 1;
-      // Check if IMS exists for nextM (globally)
-      const hasIms = DATA.some((d) => d.month === nextM && d.type !== TYPE_TMS);
-      if (!hasIms) continue;
-      let totTms = 0, totIms = 0;
-      const brandPT = [];
-      for (const [br, o] of byBrand) {
-        const t = o.tms[m], i = o.ims[nextM];
-        totTms += t; totIms += i;
-        if (t > 0) brandPT.push({ brand: br, tms: t, ims: i, pt: (i / t) * 100 });
-      }
-      pairs.push({
-        label: `${MONTHS[m].split(" ")[0]}→${MONTHS[nextM].split(" ")[0]}`,
-        tmsMonth: MONTHS[m], imsMonth: MONTHS[nextM],
-        tms: totTms, ims: totIms,
-        pt: totTms > 0 ? (totIms / totTms) * 100 : null,
-        brands: brandPT.sort((a, b) => b.tms - a.tms)
-      });
-    }
-    return pairs;
-  }, [bus, lines, brands, products, salesTypes, metric]);
 
   // Portfolio-level pull-through KPIs
   const ptKpi = useMemo(() => {
@@ -833,7 +894,7 @@ function TmsImsDashboard() {
               </div>
             )}
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
               <KpiCard
                 icon={Truck} label="Total TMS · To-Market Sales"
                 value={fmtCompact(kpi.tms)} sub={`${fmtFull(kpi.tms)} ${metricLabel}`}
@@ -870,6 +931,25 @@ function TmsImsDashboard() {
                   : kpi.sellOut >= 80 ? { bg: "bg-emerald-50", text: "text-emerald-700", value: "text-emerald-700" }
                   : { bg: "bg-amber-50", text: "text-amber-600", value: "text-amber-600" }}
               />
+              <KpiCard
+                icon={Repeat} label="Avg Pull-Through Rate"
+                value={ptKpi.avgPt === null ? "N/A" : ptKpi.avgPt.toFixed(0) + "%"}
+                sub={ptKpi.avgPt === null ? "Insufficient lag data"
+                  : ptKpi.avgPt >= 85 ? "Strong channel absorption"
+                  : ptKpi.avgPt >= 65 ? "Moderate — some inventory buildup"
+                  : "Weak — significant channel loading"}
+                accent={ptKpi.avgPt === null ? { bg: "bg-slate-100", text: "text-slate-500" }
+                  : ptKpi.avgPt >= 85 ? { bg: "bg-emerald-50", text: "text-emerald-700", value: "text-emerald-700" }
+                  : ptKpi.avgPt >= 65 ? { bg: "bg-amber-50", text: "text-amber-600", value: "text-amber-600" }
+                  : { bg: "bg-red-50", text: "text-red-600", value: "text-red-600" }}
+                badge={ptKpi.trend !== null ? (
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${
+                    ptKpi.trend >= 0 ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
+                  }`}>
+                    {ptKpi.trend >= 0 ? "+" : ""}{ptKpi.trend.toFixed(0)}pp trend
+                  </span>
+                ) : null}
+              />
             </div>
 
             <Narrative title="Executive Narrative" parts={overviewStory} />
@@ -896,10 +976,10 @@ function TmsImsDashboard() {
               </div>
 
               <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-                <h2 className="text-sm font-bold text-slate-800">Monthly Trend — Seasonality & Divergence</h2>
-                <p className="mb-2 text-xs text-slate-400">Full-year axis; Month filter intentionally not applied here</p>
+                <h2 className="text-sm font-bold text-slate-800">Monthly Trend — Seasonality, Divergence & Pull-Through</h2>
+                <p className="mb-2 text-xs text-slate-400">Full-year axis; Month filter not applied · Dashed orange line = lagged Pull-Through Rate (right axis)</p>
                 <ResponsiveContainer width="100%" height={320}>
-                  <ComposedChart data={trendChart} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                  <ComposedChart data={trendChart} margin={{ top: 5, right: 45, left: 0, bottom: 0 }}>
                     <defs>
                       <linearGradient id="gTms" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor={COLORS.tms} stopOpacity={0.18} />
@@ -912,15 +992,33 @@ function TmsImsDashboard() {
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
                     <XAxis dataKey="month" tick={{ fontSize: 12, fill: "#64748b" }} />
-                    <YAxis tickFormatter={fmtCompact} tick={{ fontSize: 11, fill: "#64748b" }} width={52} />
-                    <Tooltip content={<ChartTooltip />} />
+                    <YAxis yAxisId="left" tickFormatter={fmtCompact} tick={{ fontSize: 11, fill: "#64748b" }} width={52} />
+                    <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 10, fill: "#f97316" }} width={38}
+                      tickFormatter={(v) => v + "%"} domain={[0, "auto"]} />
+                    <Tooltip content={({ active, payload, label }) => {
+                      if (!active || !payload?.length) return null;
+                      return (
+                        <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 shadow-lg text-xs">
+                          <p className="font-semibold text-slate-700 mb-1">{label}</p>
+                          {payload.map((p) => (
+                            <p key={p.dataKey} style={{ color: p.color }} className="font-medium">
+                              {p.dataKey === "TMS" ? "To-Market Sales (TMS)" : p.dataKey === "IMS" ? "In-Market Sales (IMS)" : "Pull-Through Rate"}:{" "}
+                              {p.dataKey === "PT" ? (p.value !== null ? p.value.toFixed(0) + "%" : "—") : fmtFull(p.value) + " " + metricLabel}
+                            </p>
+                          ))}
+                        </div>
+                      );
+                    }} />
                     <Legend verticalAlign="top" height={28}
-                      formatter={(v) => (v === "TMS" ? "To-Market Sales (TMS)" : "In-Market Sales (IMS)")}
+                      formatter={(v) => v === "TMS" ? "To-Market Sales (TMS)" : v === "IMS" ? "In-Market Sales (IMS)" : "Pull-Through Rate %"}
                       wrapperStyle={{ fontSize: 12 }} />
-                    <Area dataKey="TMS" stroke="none" fill="url(#gTms)" />
-                    <Area dataKey="IMS" stroke="none" fill="url(#gIms)" />
-                    <Line dataKey="TMS" stroke={COLORS.tms} strokeWidth={2.5} dot={{ r: 3 }} />
-                    <Line dataKey="IMS" stroke={COLORS.ims} strokeWidth={2.5} dot={{ r: 3 }} />
+                    <Area yAxisId="left" dataKey="TMS" stroke="none" fill="url(#gTms)" />
+                    <Area yAxisId="left" dataKey="IMS" stroke="none" fill="url(#gIms)" />
+                    <Line yAxisId="left" dataKey="TMS" stroke={COLORS.tms} strokeWidth={2.5} dot={{ r: 3 }} />
+                    <Line yAxisId="left" dataKey="IMS" stroke={COLORS.ims} strokeWidth={2.5} dot={{ r: 3 }} />
+                    <Line yAxisId="right" dataKey="PT" stroke="#f97316" strokeWidth={2} strokeDasharray="6 3"
+                      dot={{ r: 3, fill: "#f97316" }} connectNulls={true} />
+                    <ReferenceLine yAxisId="right" y={100} stroke="#f97316" strokeDasharray="2 4" strokeOpacity={0.4} />
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
@@ -931,10 +1029,10 @@ function TmsImsDashboard() {
                 <AlertTriangle className="h-4 w-4 text-amber-500" />
                 <h2 className="text-sm font-bold text-slate-800">Risks & Opportunities</h2>
                 <span className="text-xs text-slate-400">
-                  Brand-level, respects Month / BU / Line / Sales Type filters · IMS-unreported months excluded
+                  Brand-level, respects Month / BU / Line / Sales Type filters · IMS-unreported months excluded · PT = lagged pull-through rate
                 </span>
               </div>
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
                 <div>
                   <p className="mb-2 flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-red-600">
                     <TrendingDown className="h-3.5 w-3.5" />
@@ -947,12 +1045,20 @@ function TmsImsDashboard() {
                       </p>
                     )}
                     {insights.risks.map((r) => (
-                      <div key={r.brand} className="flex items-center justify-between rounded-lg border border-red-100 bg-red-50 px-3 py-2">
-                        <span className="text-sm font-semibold text-red-800">Out of Stock Risk for {r.brand}</span>
-                        <span className="text-xs font-medium tabular-nums text-red-600">
-                          −{fmtCompact(r.gap)} {metricLabel}
-                          {r.rate !== null && ` · ${r.rate.toFixed(0)}% sell-out`}
-                        </span>
+                      <div key={r.brand} className="rounded-lg border border-red-100 bg-red-50 px-3 py-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-semibold text-red-800">{r.brand}</span>
+                          <span className="text-xs font-medium tabular-nums text-red-600">
+                            −{fmtCompact(r.gap)} {metricLabel}
+                          </span>
+                        </div>
+                        <div className="mt-1 flex items-center gap-2 text-[10px] text-red-600">
+                          {r.rate !== null && <span>{r.rate.toFixed(0)}% sell-out</span>}
+                          {r.pt.avgPt !== null && <span className="rounded bg-red-100 px-1 font-semibold">PT {r.pt.avgPt.toFixed(0)}%</span>}
+                          {r.pt.trend !== null && <span className={r.pt.trend >= 0 ? "text-emerald-600" : "text-red-700"}>
+                            {r.pt.trend >= 0 ? "↑" : "↓"}{Math.abs(r.pt.trend).toFixed(0)}pp
+                          </span>}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -969,11 +1075,48 @@ function TmsImsDashboard() {
                       </p>
                     )}
                     {insights.bottlenecks.map((r) => (
-                      <div key={r.brand} className="flex items-center justify-between rounded-lg border border-amber-100 bg-amber-50 px-3 py-2">
-                        <span className="text-sm font-semibold text-amber-800">Inventory Bottleneck for {r.brand}</span>
-                        <span className="text-xs font-medium tabular-nums text-amber-600">
-                          +{fmtCompact(r.gap)} {metricLabel} idle · {r.rate.toFixed(0)}% sell-out
-                        </span>
+                      <div key={r.brand} className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-semibold text-amber-800">{r.brand}</span>
+                          <span className="text-xs font-medium tabular-nums text-amber-600">
+                            +{fmtCompact(r.gap)} {metricLabel}
+                          </span>
+                        </div>
+                        <div className="mt-1 flex items-center gap-2 text-[10px] text-amber-600">
+                          <span>{r.rate.toFixed(0)}% sell-out</span>
+                          {r.pt.avgPt !== null && <span className="rounded bg-amber-100 px-1 font-semibold">PT {r.pt.avgPt.toFixed(0)}%</span>}
+                          {r.pt.trend !== null && <span className={r.pt.trend >= 0 ? "text-emerald-600" : "text-red-600"}>
+                            {r.pt.trend >= 0 ? "↑" : "↓"}{Math.abs(r.pt.trend).toFixed(0)}pp
+                          </span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <p className="mb-2 flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-orange-600">
+                    <TrendingDown className="h-3.5 w-3.5" />
+                    Pull-Through Declining (&gt;15pp drop) · {insights.ptDeclining.length}
+                  </p>
+                  <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+                    {insights.ptDeclining.length === 0 && (
+                      <p className="flex items-center gap-1.5 text-sm text-slate-400">
+                        <CheckCircle2 className="h-4 w-4 text-emerald-500" /> No brands with significant PT decline.
+                      </p>
+                    )}
+                    {insights.ptDeclining.map((r) => (
+                      <div key={r.brand} className="rounded-lg border border-orange-100 bg-orange-50 px-3 py-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-semibold text-orange-800">{r.brand}</span>
+                          <span className="text-xs font-bold tabular-nums text-red-600">
+                            {r.trend.toFixed(0)}pp
+                          </span>
+                        </div>
+                        <div className="mt-1 flex items-center gap-2 text-[10px] text-orange-600">
+                          <span>Avg PT {r.avgPt.toFixed(0)}%</span>
+                          <span>→ Last {r.lastPt.toFixed(0)}%</span>
+                          <span className="rounded bg-orange-100 px-1 font-semibold">Early warning</span>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -992,8 +1135,9 @@ function TmsImsDashboard() {
               <Info className="mt-0.5 h-4 w-4 shrink-0" />
               <span>
                 <strong>Methodology:</strong> Implied inventory = cumulative TMS ({MONTHS[0]}–{MONTHS[LAST_DATA_MONTH]}) − cumulative IMS ({MONTHS[0]}–{MONTHS[LAST_IMS_MONTH]}), assuming zero opening stock on Jan 1.
-                Months of Coverage (MoC) = implied inventory ÷ trailing 3-month IMS run-rate. Negative inventory means the distributor sold from pre-{MONTHS[0]} stock — request an opening balance to calibrate.
-                Month filter does not apply (cumulative view). QTY view recommended for inventory decisions.
+                MoC = implied inventory ÷ trailing 3-month IMS run-rate. <strong>PT Rate</strong> = lagged pull-through (IMS(M) ÷ TMS(M−1)).
+                <strong>PT-Adj. Stockout</strong> weights the run-rate by pull-through momentum — if PT is accelerating, depletion is faster (earlier stockout); if decelerating, slower.
+                Negative inventory = distributor selling from pre-{MONTHS[0]} stock. Month filter does not apply (cumulative view).
               </span>
             </div>
 
@@ -1042,7 +1186,7 @@ function TmsImsDashboard() {
                 <div>
                   <h2 className="text-sm font-bold text-slate-800">Coverage & Stockout Projection</h2>
                   <p className="text-xs text-slate-400">
-                    Sorted by urgency (lowest coverage first) · Last-3M run-rate = avg IMS {MONTHS[Math.max(0, LAST_IMS_MONTH - 2)]}–{MONTHS[LAST_IMS_MONTH]} · Period run-rate = avg IMS {MONTHS[0]}–{MONTHS[LAST_IMS_MONTH]}
+                    Sorted by urgency (lowest coverage first) · Run-rate = avg IMS last 3 months · PT Rate = lagged pull-through · PT-Adj. = momentum-weighted projection
                   </p>
                 </div>
                 <div className="flex items-center rounded-lg border border-slate-300 bg-slate-50 p-0.5">
@@ -1064,7 +1208,7 @@ function TmsImsDashboard() {
               </div>
 
               <div className="max-h-[420px] overflow-auto rounded-lg border border-slate-100">
-                <table className="w-full min-w-[900px] text-left text-sm">
+                <table className="w-full min-w-[1100px] text-left text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
                     <tr>
                       <th className="px-3 py-2">{invLevel === "sku" ? "Product (SKU)" : "Brand"}</th>
@@ -1072,11 +1216,13 @@ function TmsImsDashboard() {
                       <th className="px-3 py-2 text-right">Cum TMS</th>
                       <th className="px-3 py-2 text-right">Cum IMS</th>
                       <th className="px-3 py-2 text-right">Implied Inv.</th>
-                      <th className="px-3 py-2 text-right">IMS Run-rate /mo (Last 3M)</th>
-                      <th className="px-3 py-2 text-right">Period Run-rate /mo</th>
+                      <th className="px-3 py-2 text-right">Run-rate /mo</th>
                       <th className="px-3 py-2 text-right">MoC</th>
+                      <th className="px-3 py-2 text-center">PT Rate</th>
+                      <th className="px-3 py-2 text-center">PT Trend</th>
                       <th className="px-3 py-2">Status</th>
-                      <th className="px-3 py-2">Proj. Stockout</th>
+                      <th className="px-3 py-2">Stockout</th>
+                      <th className="px-3 py-2">PT-Adj. Stockout</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -1084,7 +1230,7 @@ function TmsImsDashboard() {
                       const st = mocStatus(r.inv, r.moc);
                       return (
                         <tr key={r.key} className="hover:bg-slate-50">
-                          <td className="max-w-[240px] truncate px-3 py-1.5 font-medium text-slate-800" title={r.key}>
+                          <td className="max-w-[200px] truncate px-3 py-1.5 font-medium text-slate-800" title={r.key}>
                             {r.key}
                           </td>
                           {invLevel === "sku" && (
@@ -1096,18 +1242,45 @@ function TmsImsDashboard() {
                             {fmtCompact(r.inv)}
                           </td>
                           <td className="px-3 py-1.5 text-right tabular-nums text-slate-600">{fmtCompact(r.run)}</td>
-                          <td className="px-3 py-1.5 text-right tabular-nums text-slate-500">{fmtCompact(r.runP)}</td>
                           <td className="px-3 py-1.5 text-right font-bold tabular-nums text-slate-800">
                             {r.moc === null ? "—" : r.moc.toFixed(1)}
+                          </td>
+                          <td className="px-3 py-1.5 text-center">
+                            {r.ptRate === null ? <span className="text-slate-400">—</span> : (
+                              <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                                r.ptRate >= 85 ? "bg-emerald-100 text-emerald-700"
+                                : r.ptRate >= 65 ? "bg-amber-100 text-amber-700"
+                                : "bg-red-100 text-red-700"
+                              }`}>{r.ptRate.toFixed(0)}%</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-1.5 text-center text-xs font-semibold">
+                            {r.ptTrend === null ? <span className="text-slate-400">—</span> : (
+                              <span className={r.ptTrend >= 0 ? "text-emerald-600" : "text-red-600"}>
+                                {r.ptTrend >= 0 ? "↑" : "↓"}{Math.abs(r.ptTrend).toFixed(0)}pp
+                              </span>
+                            )}
                           </td>
                           <td className="px-3 py-1.5">
                             <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${st.cls}`}>{st.label}</span>
                           </td>
                           <td className="px-3 py-1.5 text-xs text-slate-600">
                             {r.moc === null ? "—"
-                              : r.moc < 0 ? "Already depleted"
-                              : r.moc > 12 ? ">12 months"
+                              : r.moc < 0 ? "Depleted"
+                              : r.moc > 12 ? ">12 mo"
                               : `~${projectDate(r.moc)}`}
+                          </td>
+                          <td className="px-3 py-1.5 text-xs">
+                            {r.adjMoc === null ? <span className="text-slate-400">—</span>
+                              : r.adjMoc < 0 ? <span className="text-violet-600 font-semibold">Depleted</span>
+                              : r.adjMoc > 12 ? <span className="text-slate-500">>12 mo</span>
+                              : <span className={r.adjMoc < r.moc ? "text-red-600 font-semibold" : r.adjMoc > r.moc ? "text-emerald-600" : "text-slate-600"}>
+                                  ~{projectDate(r.adjMoc)}
+                                  {r.ptTrend !== null && r.adjMoc !== r.moc && (
+                                    <span className="ml-1 text-[9px]">({r.adjMoc < r.moc ? "faster" : "slower"})</span>
+                                  )}
+                                </span>
+                            }
                           </td>
                         </tr>
                       );
